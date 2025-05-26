@@ -1,0 +1,14 @@
+Flask
+flask-cors
+Werkzeug
+pyannote.audio==0.0.1
+pandas
+SpeechRecognition
+regex
+openai
+python-dotenv
+scipy
+pydub
+transformers
+git+https://github.com/VarunGumma/IndicTransToolkit.git
+onnxruntime
