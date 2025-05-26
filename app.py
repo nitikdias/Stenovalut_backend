@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, redirect, url_for,jsonify
+from flask import Flask, render_template, request, redirect, url_for
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 import os
@@ -25,6 +25,10 @@ from collections import defaultdict
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 from IndicTransToolkit.processor import IndicProcessor
+import sys
+import requests
+import json
+import base64
 
 
 app = Flask(__name__)
@@ -41,9 +45,9 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 result_df = pd.DataFrame(columns=["fileId", "speaker", "utterance","translation"])
 pipeline = Pipeline.from_pretrained(
     "pyannote/speaker-diarization-3.0",
-    use_auth_token=os.getenv("hf_token")
+    use_auth_token="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"
 )
-embedding_model = Model.from_pretrained("pyannote/embedding", use_auth_token=os.getenv("hf_token"))
+embedding_model = Model.from_pretrained("pyannote/embedding", use_auth_token="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")
 inference = Inference(embedding_model, window="whole")
 
 # Speaker label storage
@@ -58,24 +62,158 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 selected_language = "en-IN"
 summary=False
 executor = ThreadPoolExecutor(max_workers=5) # multiprocessing 
-THRESHOLD = 0.8 
+THRESHOLD = 0.6 
 transcript_lines = []
 unknown_speaker_count = 1
 last_speaker = None
 
-# Load IndicTrans model and tokenizer
-MODEL_NAME = "ai4bharat/indictrans2-indic-en-1B"
-config = BitsAndBytesConfig(load_in_8bit=True)
-indic_en_tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
-indic_en_model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, trust_remote_code=True)
-ip = IndicProcessor(inference=True)
+# indictrans2
+BATCH_SIZE = 4
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+quantization = None
+
+#bhashini
+API_KEY = "338fde5180-1e81-47a6-9eb0-944ddbd58fb1"
+USER_ID = "7f110687fdf24a979ccc9b44b8a922b3"
+CONFIG_URL = "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline"
 
 
-#functions
+# Create upload folder if not exists
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+#speech recognition 
+def extract_text_from_audio(audio_file_path, start_time, end_time):
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(audio_file_path) as source:
+        audio = recognizer.record(source)
+        start_ms = int(start_time * 1000)
+        end_ms = int((end_time + 0.2) * 1000)
+        segment = audio.get_segment(start_ms, end_ms)
+        try:
+            return recognizer.recognize_google(segment, language=selected_language)
+        except sr.UnknownValueError:
+            return None
+        except sr.RequestError as e:
+            return f"API error: {e}"    
+        
+#bhashini
 
+def get_pipeline_config():
+    """Get pipeline configuration and callback URL"""
+    headers = {
+        "ulcaApiKey": API_KEY,
+        "userID": USER_ID,
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "pipelineTasks": [
+            {
+                "taskType": "asr",
+                "config": {
+                    "language": {
+                        "sourceLanguage": "ta"
+                    }
+                }
+            }
+        ],
+        "pipelineRequestConfig": {
+            "pipelineId": "64392f96daac500b55c543cd"
+        }
+    }
+    
+    response = requests.post(CONFIG_URL, headers=headers, json=payload)
+    print("Config API Status:", response.status_code)
+    print("Config API Response:", response.text)
+    
+    if response.ok:
+        config_data = response.json()
+        callback_url = config_data.get("pipelineInferenceAPIEndPoint", {}).get("callbackUrl")
+        auth_key = config_data.get("pipelineInferenceAPIEndPoint", {}).get("inferenceApiKey", {}).get("name")
+        auth_value = config_data.get("pipelineInferenceAPIEndPoint", {}).get("inferenceApiKey", {}).get("value")
+        
+        # Get the service ID from the response
+        asr_service_id = None
+        pipeline_response_config = config_data.get("pipelineResponseConfig", [])
+        for task in pipeline_response_config:
+            if task.get("taskType") == "asr":
+                configs = task.get("config", [])
+                if configs:
+                    asr_service_id = configs[0].get("serviceId")
+                break
+        
+        return callback_url, auth_key, auth_value, asr_service_id
+    else:
+        print("Failed to get pipeline config")
+        return None, None, None, None
+    
+
+def transcribe_audio(audio_path):
+    # First, get the pipeline configuration
+    callback_url, auth_key, auth_value, service_id = get_pipeline_config()
+    
+    if not callback_url:
+        print("Failed to get callback URL from config")
+        return
+    
+    print(f"Using callback URL: {callback_url}")
+    print(f"Using service ID: {service_id}")
+    
+    # Prepare headers for inference request
+    headers = {
+        "Content-Type": "application/json"
+    }
+    if auth_key and auth_value:
+        headers[auth_key] = auth_value
+    
+    # Read and encode audio file
+    with open(audio_path, "rb") as f:
+        audio_base64 = base64.b64encode(f.read()).decode("utf-8")
+    
+    print(f"Audio file size: {len(audio_base64)} characters in base64")
+    print(f"Approximate file size: {len(audio_base64) * 3 / 4 / 1024 / 1024:.2f} MB")
+    
+    # Check if file is too large (limit to ~5MB)
+    if len(audio_base64) * 3 / 4 > 5 * 1024 * 1024:
+        print("Warning: Audio file might be too large. Consider using a shorter audio clip.")
+    
+    # Prepare inference payload
+    payload = {
+        "pipelineTasks": [
+            {
+                "taskType": "asr",
+                "config": {
+                    "language": {"sourceLanguage": "ta"},
+                    "serviceId": service_id
+                }
+            }
+        ],
+        "inputData": {
+            "audio": [
+                {"audioContent": audio_base64}
+            ]
+        }
+    }
+    
+    # Make inference request
+    response = requests.post(callback_url, headers=headers, json=payload)
+    print("Inference Status Code:", response.status_code)
+    print("Inference Response:", response.text)
+    
+    if response.ok:
+        result = response.json()
+        # Extract transcription from response
+        try:
+            transcription = result.get("pipelineResponse", [{}])[0].get("output", [{}])[0].get("source", "No transcription found")
+            print(f"\nTranscription: {transcription}")
+        except (IndexError, KeyError):
+            print("Could not extract transcription from response")
+            print("Full response:", json.dumps(result, indent=2))
+    else:
+        print("Error:", response.status_code, response.text)
+         
 #diarization starts here     
 def diarize_and_segment(chunk_path, rttm_path):
-    global segment_counter, speaker_embeddings, segment_speakers, last_speaker, transcript_lines,unknown_speaker_count
+    global segment_counter, speaker_embeddings, segment_speakers, last_speaker, transcript_lines,unknown_speaker_count,selected_language
 
     print(f" Diarizing {chunk_path}...")
     diarization = pipeline(chunk_path) # audio is sent to speaker-diarization-3.0
@@ -113,7 +251,10 @@ def diarize_and_segment(chunk_path, rttm_path):
         segment_counter += 1
 
         # Transcribe the segment
-        transcript = extract_text_from_audio(segment_path, start_time=0, end_time=duration) #segments are sent to speech_recognition
+        if selected_language=="ta-IN":
+            transcript = transcribe_audio(segment_path)
+        else:
+            transcript = extract_text_from_audio(segment_path, start_time=0, end_time=duration) #segments are sent to speech_recognition
         if not transcript or transcript.strip() == "":
             print(f" Skipping {segment_filename} — empty transcription")
             continue  # Skip embedding and labeling
@@ -169,229 +310,128 @@ def diarize_and_segment(chunk_path, rttm_path):
         with open(t_file, "w", encoding="utf-8") as f:
             f.write("\n".join(transcript_lines))
 
-# Create upload folder if not exists
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-#speech recognition 
-def extract_text_from_audio(audio_file_path, start_time, end_time):
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(audio_file_path) as source:
-        audio = recognizer.record(source)
-        start_ms = int(start_time * 1000)
-        end_ms = int((end_time + 0.2) * 1000)
-        segment = audio.get_segment(start_ms, end_ms)
-        try:
-            return recognizer.recognize_google(segment, language=selected_language)
-        except sr.UnknownValueError:
-            return None
-        except sr.RequestError as e:
-            return f"API error: {e}" 
-        
 #indictrans2 get translation
 def getTranslation(content):
-    global selected_language
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    try:
-        if selected_language=="hi-IN":
-            src_lang, tgt_lang = "hin_Deva", "eng_Latn"
-        elif selected_language=="ta-IN":
-            src_lang, tgt_lang = "tam_Taml", "eng_Latn"
-        elif selected_language=="te-IN":
-            src_lang, tgt_lang = "tel_Telu", "eng_Latn"
-        elif selected_language=="bn-IN":
-            src_lang, tgt_lang = "ben_Beng", "eng_Latn"
-        elif selected_language=="gu-IN":
-            src_lang, tgt_lang = "guj_Gujr", "eng_Latn"
-        elif selected_language=="kn-IN":
-            src_lang, tgt_lang = "kan_Knda", "eng_Latn"
-        elif selected_language=="ml-IN":
-            src_lang, tgt_lang = "mal_Mlym", "eng_Latn"
-        elif selected_language=="mr-IN":
-            src_lang, tgt_lang = "mar_Deva", "eng_Latn"
-        elif selected_language=="pa-IN":
-            src_lang, tgt_lang = "pan_Guru", "eng_Latn"
-        elif selected_language=="ur-IN":
-            src_lang, tgt_lang = "urd_Arab", "eng_Latn"
-        batch = content
+    def initialize_model_and_tokenizer(ckpt_dir, quantization):
+        if quantization == "4-bit":
+            qconfig = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+        elif quantization == "8-bit":
+            qconfig = BitsAndBytesConfig(
+                load_in_8bit=True,
+                bnb_8bit_use_double_quant=True,
+                bnb_8bit_compute_dtype=torch.bfloat16,
+            )
+        else:
+            qconfig = None
 
-        # Preprocess input
-        batch = ip.preprocess_batch(batch, src_lang=src_lang, tgt_lang=tgt_lang)
-
-        # Tokenize input
-        inputs = indic_en_tokenizer(
-            batch,
-            truncation=True,
-            padding="longest",
-            return_tensors="pt",
-            return_attention_mask=True,
+        tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=True)
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            ckpt_dir,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+            quantization_config=qconfig,
         )
 
-        # Generate translation
-        with torch.no_grad():
-            generated_tokens = indic_en_model.generate(
-                **inputs,
-                use_cache=True,
-                min_length=0,
-                max_length=256,
-                num_beams=5,
-                num_return_sequences=1,
-            )
+        if qconfig == None:
+            model = model.to(DEVICE)
+            if DEVICE == "cuda":
+                model.half()
 
-        # Decode output
-        with indic_en_tokenizer.as_target_tokenizer():
-            generated_tokens = indic_en_tokenizer.batch_decode(
-                generated_tokens.detach().cpu().tolist(),
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True,
-            )
+        model.eval()
 
-        # Post-process result
-        en_translations = ip.postprocess_batch(generated_tokens, lang=tgt_lang)
-        return en_translations
-    except Exception as e:
-        print(f"Error during translation: {e}")
-        return f"Error: {e}"
+        return tokenizer, model
+
+
+    def batch_translate(input_sentences, src_lang, tgt_lang, model, tokenizer, ip):
+        translations = []
+        for i in range(0, len(input_sentences), BATCH_SIZE):
+            batch = input_sentences[i : i + BATCH_SIZE]
+
+            # Preprocess the batch and extract entity mappings
+            batch = ip.preprocess_batch(batch, src_lang=src_lang, tgt_lang=tgt_lang)
+
+            # Tokenize the batch and generate input encodings
+            inputs = tokenizer(
+                batch,
+                truncation=True,
+                padding="longest",
+                return_tensors="pt",
+                return_attention_mask=True,
+            ).to(DEVICE)
+
+            # Generate translations using the model
+            with torch.no_grad():
+                generated_tokens = model.generate(
+                    **inputs,
+                    use_cache=True,
+                    min_length=0,
+                    max_length=256,
+                    num_beams=5,
+                    num_return_sequences=1,
+                )
+
+            # Decode the generated tokens into text
+
+            with tokenizer.as_target_tokenizer():
+                generated_tokens = tokenizer.batch_decode(
+                    generated_tokens.detach().cpu().tolist(),
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )
+
+            # Postprocess the translations, including entity replacement
+            translations += ip.postprocess_batch(generated_tokens, lang=tgt_lang)
+
+            del inputs
+            torch.cuda.empty_cache()
+
+        return translations
+
+    indic_en_ckpt_dir = "ai4bharat/indictrans2-indic-en-1B"  # ai4bharat/indictrans2-indic-en-dist-200M
+    indic_en_tokenizer, indic_en_model = initialize_model_and_tokenizer(indic_en_ckpt_dir, quantization)
+
+    ip = IndicProcessor(inference=True)
+    if selected_language=="hi-IN":
+        src_lang, tgt_lang = "hin_Deva", "eng_Latn"
+    elif selected_language=="ta-IN":
+        src_lang, tgt_lang = "tam_Taml", "eng_Latn"
+    elif selected_language=="te-IN":
+        src_lang, tgt_lang = "tel_Telu", "eng_Latn"
+    elif selected_language=="bn-IN":
+        src_lang, tgt_lang = "ben_Beng", "eng_Latn"
+    elif selected_language=="gu-IN":
+        src_lang, tgt_lang = "guj_Gujr", "eng_Latn"
+    elif selected_language=="kn-IN":
+        src_lang, tgt_lang = "kan_Knda", "eng_Latn"
+    elif selected_language=="ml-IN":
+        src_lang, tgt_lang = "mal_Mlym", "eng_Latn"
+    elif selected_language=="mr-IN":
+        src_lang, tgt_lang = "mar_Deva", "eng_Latn"
+    elif selected_language=="pa-IN":
+        src_lang, tgt_lang = "pan_Guru", "eng_Latn"
+    elif selected_language=="ur-IN":
+        src_lang, tgt_lang = "urd_Arab", "eng_Latn"
+    en_translations = batch_translate(content, src_lang, tgt_lang, indic_en_model, indic_en_tokenizer, ip)
+    
+
+    print(f"\n{src_lang} - {tgt_lang}")
+    for input_sentence, translation in zip(content, en_translations):
+        print(f"{src_lang}: {input_sentence}")
+        print(f"{tgt_lang}: {translation}")
         
+    
+    return en_translations
+    
 
 @app.route('/')
 def index():
     # Check if a file was uploaded (simple flag via query param)
     uploaded = request.args.get('uploaded')
     return render_template('index.html', uploaded=uploaded)
-
-# audio files comes from frontend to this endpoint 
-@app.route('/uploadchunk', methods=['POST'])
-def upload_audio():
-    print("Received upload request")
-    if 'audio' not in request.files:
-        print("No audio file in request")
-        return jsonify({'error': 'No audio file'}), 400
-
-    file = request.files['audio']
-    if file.filename == '':
-        print("Empty filename")
-        return jsonify({'error': 'No selected file'}), 400
-
-    filename = secure_filename(file.filename)
-    filepath = os.path.join(VOICE_FOLDER, filename) #saved in voices folder
-    print(f"Saving to {filepath}")
-    file.save(filepath)
-
-    # Run diarization and segmentation
-    rttm_path = filepath.replace(".wav", ".rttm")
-    executor.submit(diarize_and_segment, filepath, rttm_path) #sent to this function with file and empty rttm file 
-
-    return jsonify({'success': True, 'filename': filename}), 200
-
-@app.route('/get_summary_live', methods=['GET'])
-def get_summary_live():
-    global summary_ready
-    transcript_path = "live.txt"
-    if os.path.exists(transcript_path):
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            full_text = f.read()
-    else:
-        full_text = ""
-
-    if full_text.strip():
-        prompt = f"""
-        You are a helpful assistant. Please read the following meeting transcript and return the following:
-
-        1. A complete summary of the conversation without missing any points
-        2. Key discussion points (as bullet points) with which speaker said what
-        3. Action items (as bullet points) which speaker should do what
-
-        Transcript:
-        {full_text}
-
-        Format your response as:
-        Summary: ...
-        Key Points:
-        - ...
-        Actions:
-        - ...
-        """
-        try:
-            import openai
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=600,
-                temperature=0.3
-            )
-            content = response['choices'][0]['message']['content']
-            summary_part = content.split("Key Points:")[0].replace("Summary:", "").strip()
-            keypoints_part = content.split("Key Points:")[1].split("Actions:")[0].strip()
-            actions_part = content.split("Actions:")[1].strip()
-
-            app.config["SUMMARY"] = {
-                "summary": summary_part,
-                "key_points": keypoints_part,
-                "actions": actions_part
-            }
-            summary_ready = True
-            print("✅ Summary generation complete.")
-        except Exception as e:
-            print(f"❌ Error during summary generation: {e}")
-            app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
-            summary_ready = True
-    else:
-        print("⚠️ Empty transcript. No summary generated.")
-        app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
-        summary_ready = True
-    
-        
-
-    return jsonify(app.config.get("SUMMARY", {
-        "summary": "",
-        "key_points": "",
-        "actions": ""
-    }))
-
-@app.route('/get-translation')
-def get_translation():
-    transcript_path = "live.txt"
-    if not os.path.exists(transcript_path):
-        return jsonify({'translation': "Transcript not found."})
-
-    with open(transcript_path, "r", encoding="utf-8") as f:
-        content = f.read()
-        content=[content]
-    translation = getTranslation(content)
-    return jsonify({'translation': translation})
-
-@app.route('/get_transcript')
-def get_transcript():
-    transcript_path = "live.txt" 
-    if os.path.exists(transcript_path):
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        # Filter out lines where the content is None or empty after colon
-        cleaned_lines = [line.strip() for line in lines if ":" in line and line.strip().split(":", 1)[1].strip().lower() not in ["", "none"]]
-        return jsonify({"transcript": "\n\n".join(cleaned_lines)})
-    return jsonify({"transcript": ""})
-
-@app.route('/clear_live', methods=['POST'])
-def clearLive():
-    global segment_counter,selected_language
-    for folder in [VOICE_FOLDER, SEGMENT_DIR]:
-        if os.path.exists(folder):
-            print(f"Cleaning up {folder}: {os.listdir(folder)}")
-            for f in os.listdir(folder):
-                try:
-                    os.remove(os.path.join(folder, f))
-                except Exception as e:
-                    print(f"Error deleting file {f}: {e}")
-        else:
-            print(f"Folder {folder} does not exist.")
-    
-    # Truncate live.txt instead of deleting it
-    if os.path.exists("live.txt"):
-        with open("live.txt", "w", encoding="utf-8") as f:
-            f.truncate(0)
-        print("live.txt truncated (emptied).")
-    segment_counter=1
-    selected_language='en-IN'
-    return jsonify({'status': '✅ All chunks, segments, and transcript cleared'})
 
 #file is uploaded from frontend to uploads
 @app.route('/upload', methods=['POST'])
@@ -406,6 +446,8 @@ def upload_file():
     file.save(os.path.join(app.config['UPLOAD_FOLDER'], file.filename))
     return jsonify({'success': True}), 200
 
+
+from flask import jsonify
 # reads the file from uploads and process
 @app.route('/process', methods=['POST'])
 def process():
@@ -443,6 +485,9 @@ def process():
         diarize_and_segment(chunk_path, rttm_path)
         print(f"Diarization complete for: {chunk_path}")
     return jsonify({'success': True, 'chunks': total_chunks}), 200
+
+
+
 
 @app.route('/clear', methods=['POST'])
 def clear():
@@ -491,11 +536,289 @@ def clear():
     selected_language='en-IN'
     return "Files cleared", 200
 
+
+
+# audio files comes from frontend to this endpoint 
+@app.route('/uploadchunk', methods=['POST'])
+def upload_audio():
+    print("Received upload request")
+    if 'audio' not in request.files:
+        print("No audio file in request")
+        return jsonify({'error': 'No audio file'}), 400
+
+    file = request.files['audio']
+    if file.filename == '':
+        print("Empty filename")
+        return jsonify({'error': 'No selected file'}), 400
+
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(VOICE_FOLDER, filename) #saved in voices folder
+    print(f"Saving to {filepath}")
+    file.save(filepath)
+
+    # Run diarization and segmentation
+    rttm_path = filepath.replace(".wav", ".rttm")
+    executor.submit(diarize_and_segment, filepath, rttm_path) #sent to this function with file and empty rttm file 
+
+    return jsonify({'success': True, 'filename': filename}), 200
+
+
+@app.route('/transcribeUser')
+def transcribe():
+    recognizer = sr.Recognizer()
+    try:
+        with sr.AudioFile("users/newuser.wav") as source:
+            audio = recognizer.record(source)
+            text = recognizer.recognize_google(audio)
+
+            # Extract name between "my name is" and "the curious engineer"
+            name_match = re.search(r'my name is (.*?) the curious engineer', text, re.IGNORECASE)
+            name = name_match.group(1).strip().rstrip('.') if name_match else ""
+
+            return jsonify({'success': True, 'text': text, 'name': name})
+
+    except sr.UnknownValueError:
+        return jsonify({'success': False, 'error': 'Could not understand audio'})
+    except sr.RequestError as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+    
+@app.route('/upload-User', methods=['POST'])
+def upload_user():
+    if 'audio' not in request.files:
+        return jsonify({'message': ':x: No file uploaded'}), 400
+
+    audio = request.files['audio']
+    save_path = os.path.join(UPLOAD_USER, 'newuser.wav')
+    audio.save(save_path)
+    return jsonify({'message': ':white_check_mark: Audio saved as newuser.wav'})
+
+@app.route('/get_summary', methods=['GET'])
+def get_summary():
+    global summary_ready
+    transcript_path = "transcript.txt"
+    if os.path.exists(transcript_path):
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            full_text = f.read()
+    else:
+        full_text = ""
+
+    if full_text.strip():
+        prompt = f"""
+        You are a helpful assistant. Please read the following meeting transcript and return the following:
+
+        1. A complete summary of the conversation 
+        2. Key discussion points (as bullet points)
+        3. Action items (as bullet points)
+
+        Transcript:
+        {full_text}
+
+        Format your response as:
+        Summary: ...
+        Key Points:
+        - ...
+        Actions:
+        - ...
+        """
+        try:
+            import openai
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=600,
+                temperature=0.3
+            )
+            content = response['choices'][0]['message']['content']
+            summary_part = content.split("Key Points:")[0].replace("Summary:", "").strip()
+            keypoints_part = content.split("Key Points:")[1].split("Actions:")[0].strip()
+            actions_part = content.split("Actions:")[1].strip()
+
+            app.config["SUMMARY"] = {
+                "summary": summary_part,
+                "key_points": keypoints_part,
+                "actions": actions_part
+            }
+            summary_ready = True
+            print(":white_check_mark: Summary generation complete.")
+        except Exception as e:
+            print(f":x: Error during summary generation: {e}")
+            app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
+            summary_ready = True
+    else:
+        print(":warning: Empty transcript. No summary generated.")
+        app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
+        summary_ready = True
+    
+        
+
+    return jsonify(app.config.get("SUMMARY", {
+        "summary": "",
+        "key_points": "",
+        "actions": ""
+    }))
+
+
+
 @app.route('/set_language', methods=['POST'])
 def set_language():
     global selected_language
     data = request.get_json()
     selected_language = data.get('language', 'en-IN')
-    print("🔤 Language set to:", selected_language)
+    print(":abc: Language set to:", selected_language)
     return jsonify({'success': True})
 
+@app.route('/get_transcript')
+def get_transcript():
+    transcript_path = "live.txt" 
+    if os.path.exists(transcript_path):
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        # Filter out lines where the content is None or empty after colon
+        cleaned_lines = [line.strip() for line in lines if ":" in line and line.strip().split(":", 1)[1].strip().lower() not in ["", "none"]]
+        return jsonify({"transcript": "\n\n".join(cleaned_lines)})
+    return jsonify({"transcript": ""})
+
+@app.route('/get_summary_live', methods=['GET'])
+def get_summary_live():
+    global summary_ready
+    transcript_path = "live.txt"
+    if os.path.exists(transcript_path):
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            full_text = f.read()
+    else:
+        full_text = ""
+
+    if full_text.strip():
+        prompt = f"""
+        You are a helpful assistant. Please read the following meeting transcript and return the following:
+
+        1. A complete summary of the conversation without missing any points
+        2. Key discussion points (as bullet points) with which speaker said what
+        3. Action items (as bullet points) which speaker should do what
+
+        Transcript:
+        {full_text}
+
+        Format your response as:
+        Summary: ...
+        Key Points:
+        - ...
+        Actions:
+        - ...
+        """
+        try:
+            import openai
+            response = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=600,
+                temperature=0.3
+            )
+            content = response['choices'][0]['message']['content']
+            summary_part = content.split("Key Points:")[0].replace("Summary:", "").strip()
+            keypoints_part = content.split("Key Points:")[1].split("Actions:")[0].strip()
+            actions_part = content.split("Actions:")[1].strip()
+
+            app.config["SUMMARY"] = {
+                "summary": summary_part,
+                "key_points": keypoints_part,
+                "actions": actions_part
+            }
+            summary_ready = True
+            print(":white_check_mark: Summary generation complete.")
+        except Exception as e:
+            print(f":x: Error during summary generation: {e}")
+            app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
+            summary_ready = True
+    else:
+        print(":warning: Empty transcript. No summary generated.")
+        app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
+        summary_ready = True
+    
+        
+
+    return jsonify(app.config.get("SUMMARY", {
+        "summary": "",
+        "key_points": "",
+        "actions": ""
+    }))
+
+@app.route('/clear_live', methods=['POST'])
+def clearLive():
+    global segment_counter,selected_language
+    for folder in [VOICE_FOLDER, SEGMENT_DIR]:
+        if os.path.exists(folder):
+            print(f"Cleaning up {folder}: {os.listdir(folder)}")
+            for f in os.listdir(folder):
+                try:
+                    os.remove(os.path.join(folder, f))
+                except Exception as e:
+                    print(f"Error deleting file {f}: {e}")
+        else:
+            print(f"Folder {folder} does not exist.")
+    
+    # Truncate live.txt instead of deleting it
+    if os.path.exists("live.txt"):
+        with open("live.txt", "w", encoding="utf-8") as f:
+            f.truncate(0)
+        print("live.txt truncated (emptied).")
+    segment_counter=1
+    selected_language='en-IN'
+    return jsonify({'status': ':white_check_mark: All chunks, segments, and transcript cleared'})
+
+@app.route('/register-speaker', methods=['POST'])
+def register_speaker():
+    data = request.get_json()
+    name = data.get('name')
+
+    if not name:
+        return jsonify({'success': False, 'error': 'Missing name'})
+
+    source_path = os.path.join("users", "newuser.wav")
+    dest_path = os.path.join("embeddings", f"{name}.wav")
+
+    try:
+        # Move and rename the audio file
+        if not os.path.exists(source_path):
+            return jsonify({'success': False, 'error': 'Recorded audio not found'})
+
+        shutil.move(source_path, dest_path)
+
+        # Generate embedding
+        embedding = inference(dest_path).reshape(1, -1)
+        speaker_embeddings.append(embedding)
+        speaker_names.append(name)
+
+        return jsonify({'success': True, 'message': 'Speaker registered'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+    
+@app.route('/get-translation')
+def get_translation():
+    transcript_path = "live.txt"
+    if not os.path.exists(transcript_path):
+        return jsonify({'translation': "Transcript not found."})
+
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        content = f.read()
+        content=[content]
+    translation = getTranslation(content)
+    return jsonify({'translation': translation})
+
+@app.route('/get-translation-file')
+def get_translation_file():
+    transcript_path = "transcript.txt"
+    if not os.path.exists(transcript_path):
+        return jsonify({'translation': "Transcript not found."})
+
+    with open(transcript_path, "r", encoding="utf-8") as f:
+        content = f.read()
+        content=[content]
+    translation = getTranslation(content)
+    return jsonify({'translation': translation})
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
