@@ -1,7 +1,7 @@
 Flask
 flask-cors
 Werkzeug
-pyannote.audio==0.0.1
+pyannote.audio
 pandas
 SpeechRecognition
 regex
