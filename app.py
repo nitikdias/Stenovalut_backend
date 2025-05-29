@@ -29,6 +29,8 @@ import sys
 import requests
 import json
 import base64
+import torchaudio
+import time
 
 
 app = Flask(__name__)
@@ -42,13 +44,16 @@ UPLOAD_USER='users'
 SEGMENT_DIR = "segments"
 segment_counter = 1
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config['VOICE_FOLDER'] = VOICE_FOLDER
 result_df = pd.DataFrame(columns=["fileId", "speaker", "utterance","translation"])
 pipeline = Pipeline.from_pretrained(
     "pyannote/speaker-diarization-3.0",
-    use_auth_token=""
+    use_auth_token="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"
 )
-embedding_model = Model.from_pretrained("pyannote/embedding", use_auth_token="")
+embedding_model = Model.from_pretrained("pyannote/embedding", use_auth_token="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")
 inference = Inference(embedding_model, window="whole")
+
+pipeline = Pipeline.from_pretrained("pyannote/voice-activity-detection",use_auth_token="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")
 
 # Speaker label storage
 speaker_embeddings = []
@@ -62,8 +67,9 @@ openai.api_key = os.getenv("OPENAI_API_KEY")
 selected_language = "en-IN"
 summary=False
 executor = ThreadPoolExecutor(max_workers=5) # multiprocessing 
-THRESHOLD = 0.6 
+THRESHOLD = 0.8
 transcript_lines = []
+translation_lines=[]
 unknown_speaker_count = 1
 last_speaker = None
 
@@ -73,13 +79,14 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 quantization = None
 
 #bhashini
-API_KEY = ""
-USER_ID = ""
+API_KEY = "338fde5180-1e81-47a6-9eb0-944ddbd58fb1"
+USER_ID = "7f110687fdf24a979ccc9b44b8a922b3"
 CONFIG_URL = "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline"
 
 
 # Create upload folder if not exists
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(VOICE_FOLDER, exist_ok=True)
 #speech recognition 
 def extract_text_from_audio(audio_file_path, start_time, end_time):
     recognizer = sr.Recognizer()
@@ -111,7 +118,7 @@ def get_pipeline_config():
                 "taskType": "asr",
                 "config": {
                     "language": {
-                        "sourceLanguage": "ta"
+                        "sourceLanguage": "en"
                     }
                 }
             }
@@ -182,7 +189,7 @@ def transcribe_audio(audio_path):
             {
                 "taskType": "asr",
                 "config": {
-                    "language": {"sourceLanguage": "ta"},
+                    "language": {"sourceLanguage": "en"},
                     "serviceId": service_id
                 }
             }
@@ -205,14 +212,138 @@ def transcribe_audio(audio_path):
         try:
             transcription = result.get("pipelineResponse", [{}])[0].get("output", [{}])[0].get("source", "No transcription found")
             print(f"\nTranscription: {transcription}")
+            return transcription  # ← ADD THIS LINE
         except (IndexError, KeyError):
             print("Could not extract transcription from response")
             print("Full response:", json.dumps(result, indent=2))
+            return None  # ← OPTIONAL fallback return
     else:
         print("Error:", response.status_code, response.text)
+        return None  # ← OPTIONAL fallback return
+
          
 #diarization starts here     
+def safe_transcribe_audio(path, max_retries=3, delay=2):
+    for attempt in range(max_retries):
+        try:
+            result = transcribe_audio(path)
+            if result and result.strip().lower() != "none":
+                return result
+        except Exception as e:
+            print(f"[Attempt {attempt + 1}] Error during transcription: {e}")
+        time.sleep(delay)
+    print(f"Failed to transcribe {path} after {max_retries} attempts.")
+    return ""
+
 def diarize_and_segment(chunk_path, rttm_path):
+    global segment_counter, speaker_embeddings, segment_speakers, last_speaker, transcript_lines, unknown_speaker_count, selected_language
+
+    print(f" Diarizing {chunk_path}...")
+    diarization = pipeline(chunk_path)
+    print("Diarization result:", diarization)
+
+    with open(rttm_path, "w") as f:
+        diarization.write_rttm(f)
+
+    print(f" RTTM saved to {rttm_path}")
+    audio = AudioSegment.from_wav(chunk_path)
+
+    df = pd.read_csv(rttm_path, sep=" ", header=None, comment=";", names=[
+        "Type", "File ID", "Channel", "Start", "Duration",
+        "NA1", "NA2", "Speaker", "NA3", "NA4"
+    ])
+
+    for _, row in df.iterrows():
+        start = row["Start"]
+        duration = row["Duration"]
+
+        if duration < 0.5:
+            continue
+
+        buffer = 800
+        end = start + duration
+        start_ms = int(start * 1000)
+        end_ms = int(end * 1000) + buffer
+
+        segment_audio = audio[start_ms:end_ms]
+        segment_filename = f"segment_{segment_counter}.wav"
+        segment_path = os.path.join(SEGMENT_DIR, segment_filename)
+        segment_audio.export(segment_path, format="wav")
+        print(f" Saved: {segment_filename} | Start={start:.3f}s Duration={duration:.3f}s")
+        segment_counter += 1
+
+        # Transcribe and translate sequentially
+        if selected_language != "en-IN":
+            transcript = extract_text_from_audio(segment_path, 0, duration)
+            translate = safe_transcribe_audio(segment_path)
+        else:
+            transcript = extract_text_from_audio(segment_path, 0, duration)
+            translate = transcript
+
+        # Clean up None or empty strings
+        transcript = transcript or ""
+        translate = translate if translate and translate.strip().lower() != "none" else ""
+
+        if transcript.strip() == "":
+            print(f"Skipping {segment_filename} — empty transcription")
+            continue
+
+        # Speaker embeddings
+        embeddings_root = "embeddings"
+        wav_files = glob.glob(os.path.join(embeddings_root, "*.wav"))
+        speaker_pattern = re.compile(r"([a-zA-Z]+)")
+
+        for wav_path in wav_files:
+            filename = os.path.basename(wav_path)
+            match = speaker_pattern.match(filename)
+            if match:
+                speaker_name = match.group(1)
+                embedding = inference(wav_path).reshape(1, -1)
+                speaker_embeddings.append(embedding)
+                speaker_names.append(speaker_name)
+
+        emb = inference(segment_path).reshape(1, -1)
+        print(f'current={emb}')
+
+        if not speaker_embeddings:
+            speaker_embeddings.append(emb)
+            speaker_label = "Speaker_1"
+            print(f"{segment_filename} → {speaker_label} (first speaker)")
+        else:
+            distances = [cdist(emb, known_emb, metric="cosine")[0, 0] for known_emb in speaker_embeddings]
+            min_dist = min(distances)
+
+            if min_dist <= THRESHOLD:
+                speaker_idx = distances.index(min_dist)
+                speaker_label = speaker_names[speaker_idx]
+            else:
+                new_label = f"unknown_speaker_{unknown_speaker_count}"
+                unknown_speaker_count += 1
+                speaker_embeddings.append(emb)
+                speaker_names.append(new_label)
+                speaker_label = new_label
+
+            print(f"{segment_filename} → {speaker_label} (min_dist={min_dist:.4f})")
+
+        # Append transcript and translation
+        if speaker_label == last_speaker and transcript_lines:
+            transcript_lines[-1] += f" {transcript}"
+            translation_lines[-1] += f" {translate}"
+        else:
+            transcript_lines.append(f"{speaker_label}: {transcript}")
+            translation_lines.append(f"{speaker_label}: {translate}")
+
+        last_speaker = speaker_label
+
+        # Write to files
+        with open("live_transcript.txt", "w", encoding="utf-8") as f:
+            f.write("\n\n".join(transcript_lines))
+
+        with open("live_translation.txt", "w", encoding="utf-8") as f:
+            f.write("\n\n".join(translation_lines))
+
+#for live
+def diarize_and_segment_live(chunk_path, rttm_path):
     global segment_counter, speaker_embeddings, segment_speakers, last_speaker, transcript_lines,unknown_speaker_count,selected_language
 
     print(f" Diarizing {chunk_path}...")
@@ -285,6 +416,7 @@ def diarize_and_segment(chunk_path, rttm_path):
             min_dist = min(distances)
 
             if min_dist <= THRESHOLD:
+                print(THRESHOLD)
                 speaker_idx = distances.index(min_dist)
                 speaker_label = speaker_names[speaker_idx]
             else:
@@ -306,9 +438,11 @@ def diarize_and_segment(chunk_path, rttm_path):
         last_speaker = speaker_label
 
         # Write the updated transcript to file
-        t_file="live.txt"
+        t_file="live_transcript.txt"
         with open(t_file, "w", encoding="utf-8") as f:
             f.write("\n".join(transcript_lines))
+
+
 
 #indictrans2 get translation
 def getTranslation(content):
@@ -422,9 +556,46 @@ def getTranslation(content):
     for input_sentence, translation in zip(content, en_translations):
         print(f"{src_lang}: {input_sentence}")
         print(f"{tgt_lang}: {translation}")
-        
+    with open("live_translation.txt", "w", encoding="utf-8") as f:
+        f.write('\n'.join(en_translations))
+
+ 
     
     return en_translations
+
+def vad(file):
+    buffer_seconds = 0.3  # buffer length in seconds
+
+    # Run VAD pipeline on audio file, returns timeline of speech segments
+    vad_result = pipeline(file)
+
+    # Load full audio waveform and sample rate
+    waveform, sample_rate = torchaudio.load(file)
+    audio_duration = waveform.shape[1] / sample_rate
+
+    output_dir = "FileChunks"  # keep consistent with route
+    os.makedirs(output_dir, exist_ok=True)
+
+    chunk_paths = []
+
+    for i, segment in enumerate(vad_result.get_timeline()):
+        # Apply buffer, clipped to audio duration
+        start = max(segment.start - buffer_seconds, 0)
+        end = min(segment.end + buffer_seconds, audio_duration)
+
+        start_sample = int(start * sample_rate)
+        end_sample = int(end * sample_rate)
+
+        chunk_waveform = waveform[:, start_sample:end_sample]
+
+        output_path = os.path.join(output_dir, f"chunk_{i + 1}.wav")
+        torchaudio.save(output_path, chunk_waveform, sample_rate)
+        print(f"Saved: {output_path} (from {start:.2f}s to {end:.2f}s)")
+
+        chunk_paths.append(output_path)
+
+    return chunk_paths
+
     
 
 @app.route('/')
@@ -451,6 +622,8 @@ from flask import jsonify
 # reads the file from uploads and process
 @app.route('/process', methods=['POST'])
 def process():
+    global THRESHOLD
+    THRESHOLD=0.687
     wav_files = glob.glob("uploads/*.wav")
 
     if not wav_files:
@@ -465,33 +638,28 @@ def process():
     for f in os.listdir("FileChunks"):
         os.remove(os.path.join("FileChunks", f))
 
-    # Load the full audio file and chunked for 6 second 
-    audio = AudioSegment.from_file(filename)
-    chunk_length_ms = 6000  # 6 seconds
-    total_chunks = len(audio) // chunk_length_ms + int(len(audio) % chunk_length_ms > 0)
+    # Call your VAD function here which returns list of chunk paths
+    chunk_paths = vad(filename)  # This should save chunks inside "FileChunks" and return their paths
+    
+    if not chunk_paths:
+        print("No speech segments found by VAD.")
+        return jsonify({'success': False, 'message': 'No speech detected.'}), 400
 
-    # Save chunks
-    for i in range(total_chunks):
-        start = i * chunk_length_ms
-        end = min((i + 1) * chunk_length_ms, len(audio))
-        chunk = audio[start:end]
-        chunk_filename = f"chunk_{i + 1}.wav"
-        chunk_path = os.path.join("FileChunks", chunk_filename)
-        chunk.export(chunk_path, format="wav")
-        print(f"Saved: {chunk_path}")
-
+    # Process each chunk with diarization
+    for chunk_path in chunk_paths:
         rttm_path = chunk_path.replace(".wav", ".rttm")
-        #sent to diarize 
         diarize_and_segment(chunk_path, rttm_path)
         print(f"Diarization complete for: {chunk_path}")
-    return jsonify({'success': True, 'chunks': total_chunks}), 200
+
+    return jsonify({'success': True, 'chunks': len(chunk_paths)}), 200
+
 
 
 
 
 @app.route('/clear', methods=['POST'])
 def clear():
-    global segment_counter,selected_language
+    global segment_counter, selected_language, speaker_embeddings, segment_speakers, speaker_names, transcript_lines, translation_lines, unknown_speaker_count,last_speaker, summary
     print("clear was clicked")
 
     # Clear .wav files from the uploads folder
@@ -528,12 +696,24 @@ def clear():
                 print(f"Error deleting from FileChunks {filename}: {e}")
 
     # Truncate transcript.txt
-    if os.path.exists("live.txt"):
-        with open("live.txt", "w", encoding="utf-8") as f:
+    if os.path.exists("live_transcript.txt"):
+        with open("live_transcript.txt", "w", encoding="utf-8") as f:
             f.truncate(0)
-        print("live.txt truncated (emptied).")
-    segment_counter=1
-    selected_language='en-IN'
+        print("live_transcript.txt truncated (emptied).")
+    if os.path.exists("live_translation.txt"):
+        with open("live_translation.txt", "w", encoding="utf-8") as f:
+            f.truncate(0)
+        print("live_translation.txt truncated (emptied).")
+    segment_counter = 1
+    selected_language = 'en-IN'
+    speaker_embeddings = []
+    segment_speakers = []
+    speaker_names = []
+    transcript_lines = []
+    translation_lines = []
+    unknown_speaker_count = 1
+    last_speaker = None
+    summary = False
     return "Files cleared", 200
 
 
@@ -558,24 +738,23 @@ def upload_audio():
 
     # Run diarization and segmentation
     rttm_path = filepath.replace(".wav", ".rttm")
-    executor.submit(diarize_and_segment, filepath, rttm_path) #sent to this function with file and empty rttm file 
+    executor.submit(diarize_and_segment_live, filepath, rttm_path) #sent to this function with file and empty rttm file 
 
     return jsonify({'success': True, 'filename': filename}), 200
 
 
 @app.route('/transcribeUser')
 def transcribe():
-    recognizer = sr.Recognizer()
     try:
-        with sr.AudioFile("users/newuser.wav") as source:
-            audio = recognizer.record(source)
-            text = recognizer.recognize_google(audio)
+        audio="users/newuser.wav"
+        text = transcribe_audio(audio)
+        print(text)
 
-            # Extract name between "my name is" and "the curious engineer"
-            name_match = re.search(r'my name is (.*?) the curious engineer', text, re.IGNORECASE)
-            name = name_match.group(1).strip().rstrip('.') if name_match else ""
+        # Extract name between "my name is" and "the curious engineer"
+        name_match = re.search(r'my name is (.*?) the curious engineer', text, re.IGNORECASE)
+        name = name_match.group(1).strip().rstrip('.') if name_match else ""
 
-            return jsonify({'success': True, 'text': text, 'name': name})
+        return jsonify({'success': True, 'text': text, 'name': name})
 
     except sr.UnknownValueError:
         return jsonify({'success': False, 'error': 'Could not understand audio'})
@@ -587,12 +766,12 @@ def transcribe():
 @app.route('/upload-User', methods=['POST'])
 def upload_user():
     if 'audio' not in request.files:
-        return jsonify({'message': ':x: No file uploaded'}), 400
+        return jsonify({'message': '❌ No file uploaded'}), 400
 
     audio = request.files['audio']
     save_path = os.path.join(UPLOAD_USER, 'newuser.wav')
     audio.save(save_path)
-    return jsonify({'message': ':white_check_mark: Audio saved as newuser.wav'})
+    return jsonify({'message': '✅ Audio saved as newuser.wav'})
 
 @app.route('/get_summary', methods=['GET'])
 def get_summary():
@@ -641,13 +820,13 @@ def get_summary():
                 "actions": actions_part
             }
             summary_ready = True
-            print(":white_check_mark: Summary generation complete.")
+            print("✅ Summary generation complete.")
         except Exception as e:
-            print(f":x: Error during summary generation: {e}")
+            print(f"❌ Error during summary generation: {e}")
             app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
             summary_ready = True
     else:
-        print(":warning: Empty transcript. No summary generated.")
+        print("⚠️ Empty transcript. No summary generated.")
         app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
         summary_ready = True
     
@@ -666,24 +845,33 @@ def set_language():
     global selected_language
     data = request.get_json()
     selected_language = data.get('language', 'en-IN')
-    print(":abc: Language set to:", selected_language)
+    print("🔤 Language set to:", selected_language)
     return jsonify({'success': True})
 
-@app.route('/get_transcript')
+@app.route('/get_transcript', methods=['GET'])
 def get_transcript():
-    transcript_path = "live.txt" 
-    if os.path.exists(transcript_path):
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        # Filter out lines where the content is None or empty after colon
-        cleaned_lines = [line.strip() for line in lines if ":" in line and line.strip().split(":", 1)[1].strip().lower() not in ["", "none"]]
-        return jsonify({"transcript": "\n\n".join(cleaned_lines)})
-    return jsonify({"transcript": ""})
+    with open("live_transcript.txt", "r", encoding="utf-8") as f:
+        transcript = f.read()
+    
+    try:
+        with open("live_translation.txt", "r", encoding="utf-8") as f:
+            translation = f.read()
+    except FileNotFoundError:
+        translation = ""
+
+    return jsonify({
+        "transcript": transcript,
+        "translation": translation
+    })
+
 
 @app.route('/get_summary_live', methods=['GET'])
 def get_summary_live():
-    global summary_ready
-    transcript_path = "live.txt"
+    global summary_ready,selected_language
+    if selected_language=="en-IN":
+        transcript_path = "live_transcript.txt"
+    else:
+        transcript_path="live_translation.txt"
     if os.path.exists(transcript_path):
         with open(transcript_path, "r", encoding="utf-8") as f:
             full_text = f.read()
@@ -727,13 +915,13 @@ def get_summary_live():
                 "actions": actions_part
             }
             summary_ready = True
-            print(":white_check_mark: Summary generation complete.")
+            print("✅ Summary generation complete.")
         except Exception as e:
-            print(f":x: Error during summary generation: {e}")
+            print(f"❌ Error during summary generation: {e}")
             app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
             summary_ready = True
     else:
-        print(":warning: Empty transcript. No summary generated.")
+        print("⚠️ Empty transcript. No summary generated.")
         app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
         summary_ready = True
     
@@ -747,7 +935,8 @@ def get_summary_live():
 
 @app.route('/clear_live', methods=['POST'])
 def clearLive():
-    global segment_counter,selected_language
+    global segment_counter, selected_language, speaker_embeddings, segment_speakers, speaker_names, transcript_lines, translation_lines, unknown_speaker_count, last_speaker, summary
+
     for folder in [VOICE_FOLDER, SEGMENT_DIR]:
         if os.path.exists(folder):
             print(f"Cleaning up {folder}: {os.listdir(folder)}")
@@ -759,14 +948,29 @@ def clearLive():
         else:
             print(f"Folder {folder} does not exist.")
     
-    # Truncate live.txt instead of deleting it
-    if os.path.exists("live.txt"):
-        with open("live.txt", "w", encoding="utf-8") as f:
-            f.truncate(0)
-        print("live.txt truncated (emptied).")
-    segment_counter=1
-    selected_language='en-IN'
-    return jsonify({'status': ':white_check_mark: All chunks, segments, and transcript cleared'})
+    # Truncate transcript.txt and translation.txt
+    for file_path in ["live_transcript.txt", "live_translation.txt"]:
+        if os.path.exists(file_path):
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.truncate(0)
+            print(f"{file_path} truncated (emptied).")
+
+    # Reset all global variables to initial state
+    segment_counter = 1
+    selected_language = 'en-IN'
+    speaker_embeddings = []
+    segment_speakers = []
+    speaker_names = []
+    transcript_lines = []
+    translation_lines = []
+    unknown_speaker_count = 1
+    last_speaker = None
+    summary = False
+
+    print("All global variables reset.")
+
+    return jsonify({'status': '✅ All chunks, segments, and transcript cleared'})
+
 
 @app.route('/register-speaker', methods=['POST'])
 def register_speaker():
@@ -797,7 +1001,7 @@ def register_speaker():
     
 @app.route('/get-translation')
 def get_translation():
-    transcript_path = "live.txt"
+    transcript_path = "live_transcript.txt"
     if not os.path.exists(transcript_path):
         return jsonify({'translation': "Transcript not found."})
 
@@ -818,6 +1022,22 @@ def get_translation_file():
         content=[content]
     translation = getTranslation(content)
     return jsonify({'translation': translation})
+
+EMBEDDINGS_DIR = 'embeddings'  # path to your embeddings folder
+
+@app.route('/list-users', methods=['GET'])
+def list_users():
+    try:
+        # List all .wav files in the embeddings folder
+        files = os.listdir(EMBEDDINGS_DIR)
+        audio_files = [f for f in files if f.lower().endswith('.wav')]
+
+        # Strip .wav extension
+        user_names = [os.path.splitext(f)[0] for f in audio_files]
+
+        return jsonify({"users": user_names})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':
