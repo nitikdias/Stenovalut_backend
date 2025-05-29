@@ -23,6 +23,8 @@ This is the backend service for the **StenoVault** application. It handles audio
 3. **Text files**<br/>
    live_transcript.txt<br/>
    live_translation.txt<br/>
+
+4.Add secrate keys
    
 
 
