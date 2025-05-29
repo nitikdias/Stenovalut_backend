@@ -17,15 +17,15 @@ This is the backend service for the **StenoVault** application. It handles audio
    ```
 
 2. **Create Files**
-   FileChunks
-   uploads
-   users
-   voices
-   segments
+   FileChunks<br/>
+   uploads<br/>
+   users<br/>
+   voices<br/>
+   segments<br/>
    <br/>
 3. **Text files**
-   live_transcript.txt
-   live_translation.txt
+   live_transcript.txt<br/>
+   live_translation.txt<br/>
    
 
 
