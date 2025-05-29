@@ -751,7 +751,7 @@ def transcribe():
         print(text)
 
         # Extract name between "my name is" and "the curious engineer"
-        name_match = re.search(r'my name is (.*?) the curious engineer', text, re.IGNORECASE)
+        name_match = re.search(r'my name is (.*?) the', text, re.IGNORECASE)
         name = name_match.group(1).strip().rstrip('.') if name_match else ""
 
         return jsonify({'success': True, 'text': text, 'name': name})
