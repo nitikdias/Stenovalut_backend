@@ -16,4 +16,15 @@ This is the backend service for the **StenoVault** application. It handles audio
    python app.py
    ```
 
+2. ** Create Files**
+   FileChunks
+   uploads
+   users
+   voices
+   segments
+3.**Text files**
+   live_transcript.txt
+   live_translation.txt
+   
+
 
