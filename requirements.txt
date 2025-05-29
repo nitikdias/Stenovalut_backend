@@ -10,5 +10,4 @@ python-dotenv
 scipy
 pydub
 transformers
-git+https://github.com/VarunGumma/IndicTransToolkit.git
 onnxruntime
