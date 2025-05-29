@@ -13,18 +13,19 @@ This is the backend service for the **StenoVault** application. It handles audio
    python app.py
    ```
 
-2. **Create Files**<br/>
+2. **Create Folder**<br/>
    FileChunks<br/>
    uploads<br/>
    users<br/>
    voices<br/>
    segments<br/>
    <br/>
-3. **Text files**<br/>
+3. **Create Text files**<br/>
    live_transcript.txt<br/>
    live_translation.txt<br/>
 
 4.Add secrate keys
+create .env file for openai
    
 
 
