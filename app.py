@@ -48,12 +48,12 @@ app.config['VOICE_FOLDER'] = VOICE_FOLDER
 result_df = pd.DataFrame(columns=["fileId", "speaker", "utterance","translation"])
 pipeline = Pipeline.from_pretrained(
     "pyannote/speaker-diarization-3.0",
-    use_auth_token="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"
+    use_auth_token="change_here"
 )
-embedding_model = Model.from_pretrained("pyannote/embedding", use_auth_token="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")
+embedding_model = Model.from_pretrained("pyannote/embedding", use_auth_token="change_here")
 inference = Inference(embedding_model, window="whole")
 
-pipeline = Pipeline.from_pretrained("pyannote/voice-activity-detection",use_auth_token="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")
+pipeline = Pipeline.from_pretrained("pyannote/voice-activity-detection",use_auth_token="change_here")
 
 # Speaker label storage
 speaker_embeddings = []
@@ -79,8 +79,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 quantization = None
 
 #bhashini
-API_KEY = "338fde5180-1e81-47a6-9eb0-944ddbd58fb1"
-USER_ID = "7f110687fdf24a979ccc9b44b8a922b3"
+API_KEY = "change_here"
+USER_ID = "change_id"
 CONFIG_URL = "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline"
 
 
