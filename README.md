@@ -23,7 +23,7 @@ This is the backend service for the **StenoVault** application. It handles audio
    voices
    segments
    <br/>
-3.**Text files**
+3. **Text files**
    live_transcript.txt
    live_translation.txt
    
