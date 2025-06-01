@@ -48,12 +48,12 @@ app.config['VOICE_FOLDER'] = VOICE_FOLDER
 result_df = pd.DataFrame(columns=["fileId", "speaker", "utterance","translation"])
 pipeline = Pipeline.from_pretrained(
     "pyannote/speaker-diarization-3.0",
-    use_auth_token="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"
+    use_auth_token="change_here"
 )
-embedding_model = Model.from_pretrained("pyannote/embedding", use_auth_token="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")
+embedding_model = Model.from_pretrained("pyannote/embedding", use_auth_token="change_here")
 inference = Inference(embedding_model, window="whole")
 
-pipeline = Pipeline.from_pretrained("pyannote/voice-activity-detection",use_auth_token="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")
+pipeline = Pipeline.from_pretrained("pyannote/voice-activity-detection",use_auth_token="change_here")
 
 # Speaker label storage
 speaker_embeddings = []
@@ -79,8 +79,8 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 quantization = None
 
 #bhashini
-API_KEY = "338fde5180-1e81-47a6-9eb0-944ddbd58fb1"
-USER_ID = "7f110687fdf24a979ccc9b44b8a922b3"
+API_KEY = "Bhashini_api_change_here"
+USER_ID = "change_here_id"
 CONFIG_URL = "https://meity-auth.ulcacontrib.org/ulca/apis/v0/model/getModelsPipeline"
 
 
@@ -425,7 +425,7 @@ def diarize_and_segment_live(chunk_path, rttm_path):
                 speaker_embeddings.append(emb)
                 speaker_names.append(new_label)
                 speaker_label = new_label
-
+                
             print(f"{segment_filename} → {speaker_label} (min_dist={min_dist:.4f})")
             segment_speakers.append((segment_filename, speaker_label))
             print(f"{speaker_label}: {transcript}")
@@ -773,73 +773,6 @@ def upload_user():
     audio.save(save_path)
     return jsonify({'message': '✅ Audio saved as newuser.wav'})
 
-@app.route('/get_summary', methods=['GET'])
-def get_summary():
-    global summary_ready
-    transcript_path = "transcript.txt"
-    if os.path.exists(transcript_path):
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            full_text = f.read()
-    else:
-        full_text = ""
-
-    if full_text.strip():
-        prompt = f"""
-        You are a helpful assistant. Please read the following meeting transcript and return the following:
-
-        1. A complete summary of the conversation 
-        2. Key discussion points (as bullet points)
-        3. Action items (as bullet points)
-
-        Transcript:
-        {full_text}
-
-        Format your response as:
-        Summary: ...
-        Key Points:
-        - ...
-        Actions:
-        - ...
-        """
-        try:
-            import openai
-            response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=600,
-                temperature=0.3
-            )
-            content = response['choices'][0]['message']['content']
-            summary_part = content.split("Key Points:")[0].replace("Summary:", "").strip()
-            keypoints_part = content.split("Key Points:")[1].split("Actions:")[0].strip()
-            actions_part = content.split("Actions:")[1].strip()
-
-            app.config["SUMMARY"] = {
-                "summary": summary_part,
-                "key_points": keypoints_part,
-                "actions": actions_part
-            }
-            summary_ready = True
-            print("✅ Summary generation complete.")
-        except Exception as e:
-            print(f"❌ Error during summary generation: {e}")
-            app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
-            summary_ready = True
-    else:
-        print("⚠️ Empty transcript. No summary generated.")
-        app.config["SUMMARY"] = {"summary": "", "key_points": "", "actions": ""}
-        summary_ready = True
-    
-        
-
-    return jsonify(app.config.get("SUMMARY", {
-        "summary": "",
-        "key_points": "",
-        "actions": ""
-    }))
-
-
-
 @app.route('/set_language', methods=['POST'])
 def set_language():
     global selected_language
@@ -850,9 +783,9 @@ def set_language():
 
 @app.route('/get_transcript', methods=['GET'])
 def get_transcript():
+    global speaker_embeddings
     with open("live_transcript.txt", "r", encoding="utf-8") as f:
         transcript = f.read()
-    
     try:
         with open("live_translation.txt", "r", encoding="utf-8") as f:
             translation = f.read()
@@ -863,6 +796,7 @@ def get_transcript():
         "transcript": transcript,
         "translation": translation
     })
+    
 
 
 @app.route('/get_summary_live', methods=['GET'])
@@ -982,22 +916,15 @@ def register_speaker():
 
     source_path = os.path.join("users", "newuser.wav")
     dest_path = os.path.join("embeddings", f"{name}.wav")
+    shutil.copy(source_path, dest_path)
 
-    try:
-        # Move and rename the audio file
-        if not os.path.exists(source_path):
-            return jsonify({'success': False, 'error': 'Recorded audio not found'})
+    # Compute and store embedding in memory
+    embedding = inference(dest_path).reshape(1, -1)
+    speaker_embeddings.append(embedding)
+    speaker_names.append(name)
 
-        shutil.move(source_path, dest_path)
+    return jsonify({'success': True, 'message': 'Speaker registered successfully'})
 
-        # Generate embedding
-        embedding = inference(dest_path).reshape(1, -1)
-        speaker_embeddings.append(embedding)
-        speaker_names.append(name)
-
-        return jsonify({'success': True, 'message': 'Speaker registered'})
-    except Exception as e:
-        return jsonify({'success': False, 'error': str(e)})
     
 @app.route('/get-translation')
 def get_translation():
